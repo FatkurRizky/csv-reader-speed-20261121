@@ -1,7 +1,17 @@
 // Ultra-fast drop-in replacement for make.fun's csv-reader 1.0.0.
 // Pure ES module, zero dependencies, deterministic, stateless.
+// Optimized for Node 22 / V8 TurboFan: chunked body parser (eliminates OSR
+// double-compilation), lazy nextLF/nextCR/nextComma SIMD indexOf tracking,
+// single-line quoted fast path, and zero-deopt cold-helper separation.
 
-function readUnquotedSlow(text, len, start, crPos, state, errors, recordLine, recordRow) {
+let gPos = 0;
+let gLine = 1;
+let gEndedComma = false;
+let gNextLF = -1;
+let gNextCR = -1;
+let gNextComma = -1;
+
+function readUnquotedSlow(text, len, start, crPos, line, errors, recordLine, recordRow) {
   let acc = text.slice(start, crPos);
   errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
   let p = crPos + 1;
@@ -20,7 +30,7 @@ function readUnquotedSlow(text, len, start, crPos, state, errors, recordLine, re
       if (ch === 10) {
         if (p > seg) acc += text.slice(seg, p);
         p += 1;
-        state.line += 1;
+        line += 1;
         ended = 2;
         break;
       }
@@ -28,7 +38,7 @@ function readUnquotedSlow(text, len, start, crPos, state, errors, recordLine, re
         if (p + 1 < len && text.charCodeAt(p + 1) === 10) {
           if (p > seg) acc += text.slice(seg, p);
           p += 2;
-          state.line += 1;
+          line += 1;
           ended = 2;
           break;
         }
@@ -41,15 +51,14 @@ function readUnquotedSlow(text, len, start, crPos, state, errors, recordLine, re
     }
     p += 1;
   }
-  if (ended === 0 && p > seg) {
-    acc += text.slice(seg, p);
-  }
-  state.pos = p;
-  state.endedComma = ended === 1;
+  if (ended === 0 && p > seg) acc += text.slice(seg, p);
+  gPos = p;
+  gLine = line;
+  gEndedComma = ended === 1;
   return acc;
 }
 
-function readQuoteJunk(text, len, p, val, state, errors, recordLine, recordRow) {
+function readQuoteJunk(text, len, p, val, line, errors, recordLine, recordRow) {
   let acc = val;
   let seg = p;
   let added = 0;
@@ -73,7 +82,7 @@ function readQuoteJunk(text, len, p, val, state, errors, recordLine, recordRow) 
           added += p - seg;
         }
         p += 1;
-        state.line += 1;
+        line += 1;
         ended = 2;
         break;
       }
@@ -84,7 +93,7 @@ function readQuoteJunk(text, len, p, val, state, errors, recordLine, recordRow) 
             added += p - seg;
           }
           p += 2;
-          state.line += 1;
+          line += 1;
           ended = 2;
           break;
         }
@@ -104,17 +113,16 @@ function readQuoteJunk(text, len, p, val, state, errors, recordLine, recordRow) 
     acc += text.slice(seg, p);
     added += p - seg;
   }
-  if (added > 0) {
-    errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-  }
-  state.pos = p;
-  state.endedComma = ended === 1;
+  if (added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+  gPos = p;
+  gLine = line;
+  gEndedComma = ended === 1;
   return acc;
 }
 
-function readUnterminated(text, len, open, openLine, state, errors, recordLine, recordRow) {
+function readUnterminated(text, len, open, openLine, errors, recordLine, recordRow) {
   let p = open + 1;
-  state.line = openLine;
+  let line = openLine;
   errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
   let acc = '"';
   let seg = p;
@@ -132,7 +140,7 @@ function readUnterminated(text, len, open, openLine, state, errors, recordLine, 
       if (ch === 10) {
         if (p > seg) acc += text.slice(seg, p);
         p += 1;
-        state.line += 1;
+        line += 1;
         ended = 2;
         break;
       }
@@ -140,7 +148,7 @@ function readUnterminated(text, len, open, openLine, state, errors, recordLine, 
         if (p + 1 < len && text.charCodeAt(p + 1) === 10) {
           if (p > seg) acc += text.slice(seg, p);
           p += 2;
-          state.line += 1;
+          line += 1;
           ended = 2;
           break;
         }
@@ -153,49 +161,39 @@ function readUnterminated(text, len, open, openLine, state, errors, recordLine, 
     }
     p += 1;
   }
-  if (ended === 0 && p > seg) {
-    acc += text.slice(seg, p);
-  }
-  state.pos = p;
-  state.endedComma = ended === 1;
+  if (ended === 0 && p > seg) acc += text.slice(seg, p);
+  gPos = p;
+  gLine = line;
+  gEndedComma = ended === 1;
   return acc;
 }
 
-function readQuotedSlow(text, len, open, q, state, errors, recordLine, recordRow) {
-  const openLine = state.line;
-  if (q === -1) {
-    return readUnterminated(text, len, open, openLine, state, errors, recordLine, recordRow);
-  }
+function readQuotedComplex(text, len, open, q, lineEnd, line, errors, recordLine, recordRow) {
+  const openLine = line;
+  if (q === -1) return readUnterminated(text, len, open, openLine, errors, recordLine, recordRow);
 
   let seg = open + 1;
   let acc = '';
   let hasAcc = false;
-  let line = openLine;
-  let nextLF = state.nextLF;
-  let nextCR = state.nextCR;
 
   while (true) {
-    if (nextCR !== -1 && nextCR < q) {
-      while (nextCR !== -1 && nextCR < q) {
-        while (nextLF !== -1 && nextLF < nextCR) {
-          line += 1;
-          nextLF = text.indexOf('\n', nextLF + 1);
+    if (q >= lineEnd) {
+      let p = seg;
+      while (p < q) {
+        const ch = text.charCodeAt(p);
+        if (ch <= 13) {
+          if (ch === 10) {
+            line += 1;
+          } else if (ch === 13) {
+            acc += text.slice(seg, p) + '\n';
+            hasAcc = true;
+            line += 1;
+            if (p + 1 < q && text.charCodeAt(p + 1) === 10) p += 1;
+            seg = p + 1;
+          }
         }
-        acc += text.slice(seg, nextCR) + '\n';
-        hasAcc = true;
-        line += 1;
-        if (nextCR + 1 < len && text.charCodeAt(nextCR + 1) === 10) {
-          seg = nextCR + 2;
-          if (nextLF === nextCR + 1) nextLF = text.indexOf('\n', seg);
-        } else {
-          seg = nextCR + 1;
-        }
-        nextCR = text.indexOf('\r', seg);
+        p += 1;
       }
-    }
-    while (nextLF !== -1 && nextLF < q) {
-      line += 1;
-      nextLF = text.indexOf('\n', nextLF + 1);
     }
 
     if (q + 1 < len && text.charCodeAt(q + 1) === 34) {
@@ -203,52 +201,56 @@ function readQuotedSlow(text, len, open, q, state, errors, recordLine, recordRow
       hasAcc = true;
       seg = q + 2;
       q = text.indexOf('"', seg);
-      if (q === -1) {
-        state.nextLF = text.indexOf('\n', open + 1);
-        state.nextCR = text.indexOf('\r', open + 1);
-        return readUnterminated(text, len, open, openLine, state, errors, recordLine, recordRow);
-      }
+      if (q === -1) return readUnterminated(text, len, open, openLine, errors, recordLine, recordRow);
       continue;
     }
 
-    const val = hasAcc ? acc + text.slice(seg, q) : (q === seg ? '' : text.slice(seg, q));
-    const p = q + 1;
-    state.line = line;
-    state.nextLF = nextLF;
-    state.nextCR = nextCR;
-
-    if (p >= len) {
-      state.pos = p;
-      state.endedComma = false;
+    const val = hasAcc ? (q === seg ? acc : acc + text.slice(seg, q)) : (q === seg ? '' : text.slice(seg, q));
+    const after = q + 1;
+    if (after >= len) {
+      gPos = after;
+      gLine = line;
+      gEndedComma = false;
       return val;
     }
-    const next = text.charCodeAt(p);
+    const next = text.charCodeAt(after);
     if (next === 44) {
-      state.pos = p + 1;
-      state.endedComma = true;
+      gPos = after + 1;
+      gLine = line;
+      gEndedComma = true;
       return val;
     }
     if (next === 10) {
-      state.pos = p + 1;
-      state.line = line + 1;
-      state.endedComma = false;
+      gPos = after + 1;
+      gLine = line + 1;
+      gEndedComma = false;
       return val;
     }
-    if (next === 13 && p + 1 < len && text.charCodeAt(p + 1) === 10) {
-      state.pos = p + 2;
-      state.line = line + 1;
-      state.endedComma = false;
+    if (next === 13 && after + 1 < len && text.charCodeAt(after + 1) === 10) {
+      gPos = after + 2;
+      gLine = line + 1;
+      gEndedComma = false;
       return val;
     }
-    return readQuoteJunk(text, len, p, val, state, errors, recordLine, recordRow);
+    return readQuoteJunk(text, len, after, val, line, errors, recordLine, recordRow);
   }
 }
 
-function parseFirstRecord(text, len, state, errors, header) {
-  let pos = state.pos;
-  let line = state.line;
-  let nextLF = state.nextLF;
-  let nextCR = state.nextCR;
+function finishAbnormalRow(fields, fi, width, lastQuoted, extra, recordLine, rows, errors) {
+  if (fi === 1 && fields[0] === '' && !lastQuoted) return;
+  if (fi < width) {
+    errors.push({ code: 'short_row', line: recordLine, row: rows.length, fields: fi });
+    for (let i = fi; i < width; i++) fields[i] = '';
+    rows.push(fields);
+  } else {
+    errors.push({ code: 'long_row', line: recordLine, row: rows.length, extra });
+    rows.push(fields);
+  }
+}
+
+function parseFirstRecord(text, len, errors, header) {
+  let pos = gPos;
+  let line = gLine;
 
   while (pos < len) {
     const c0 = text.charCodeAt(pos);
@@ -271,19 +273,10 @@ function parseFirstRecord(text, len, state, errors, header) {
     while (true) {
       if (pos < len && text.charCodeAt(pos) === 34) {
         lastQuoted = true;
-        if (nextLF !== -1 && nextLF < pos + 1) nextLF = text.indexOf('\n', pos + 1);
-        if (nextCR !== -1 && nextCR < pos + 1) nextCR = text.indexOf('\r', pos + 1);
-        const q = text.indexOf('"', pos + 1);
-        state.line = line;
-        state.nextLF = nextLF;
-        state.nextCR = nextCR;
-        const val = readQuotedSlow(text, len, pos, q, state, errors, recordLine, recordRow);
-        pos = state.pos;
-        line = state.line;
-        nextLF = state.nextLF;
-        nextCR = state.nextCR;
-        fields.push(val);
-        if (!state.endedComma) break;
+        fields.push(readQuotedComplex(text, len, pos, text.indexOf('"', pos + 1), -1, line, errors, recordLine, recordRow));
+        pos = gPos;
+        line = gLine;
+        if (!gEndedComma) break;
         continue;
       }
 
@@ -315,12 +308,10 @@ function parseFirstRecord(text, len, state, errors, header) {
               ended = 2;
               break;
             }
-            state.line = line;
-            const val = readUnquotedSlow(text, len, start, p, state, errors, recordLine, recordRow);
-            pos = state.pos;
-            line = state.line;
-            fields.push(val);
-            ended = state.endedComma ? 1 : 2;
+            fields.push(readUnquotedSlow(text, len, start, p, line, errors, recordLine, recordRow));
+            pos = gPos;
+            line = gLine;
+            ended = gEndedComma ? 1 : 2;
             break;
           }
         }
@@ -335,51 +326,25 @@ function parseFirstRecord(text, len, state, errors, header) {
     }
 
     if (fields.length === 1 && fields[0] === '' && !lastQuoted) continue;
-    state.pos = pos;
-    state.line = line;
-    state.nextLF = nextLF;
-    state.nextCR = nextCR;
+    gPos = pos;
+    gLine = line;
     return fields;
   }
 
-  state.pos = pos;
-  state.line = line;
-  state.nextLF = nextLF;
-  state.nextCR = nextCR;
+  gPos = pos;
+  gLine = line;
   return null;
 }
 
-export function run(input) {
-  const text = String(input.text);
-  const header = input.header === true;
-  const len = text.length;
-  const errors = [];
-  const rows = [];
+function parseChunk(text, len, width, rows, errors, limit) {
+  let pos = gPos;
+  let line = gLine;
+  let nextLF = gNextLF;
+  let nextCR = gNextCR;
+  let nextComma = gNextComma;
+  let count = 0;
 
-  let pos = len > 0 && text.charCodeAt(0) === 0xfeff ? 1 : 0;
-  const state = {
-    pos,
-    line: 1,
-    endedComma: false,
-    nextLF: text.indexOf('\n', pos),
-    nextCR: text.indexOf('\r', pos),
-  };
-
-  const first = parseFirstRecord(text, len, state, errors, header);
-  if (first === null) {
-    return { columns: header ? [] : null, rows, errors };
-  }
-
-  const width = first.length;
-  const columns = header ? first : null;
-  if (!header) rows.push(first);
-
-  pos = state.pos;
-  let line = state.line;
-  let nextLF = state.nextLF;
-  let nextCR = state.nextCR;
-
-  while (pos < len) {
+  while (pos < len && count < limit) {
     const c0 = text.charCodeAt(pos);
     if (c0 === 10) {
       pos += 1;
@@ -392,17 +357,17 @@ export function run(input) {
       continue;
     }
 
+    count += 1;
     const recordLine = line;
     const fields = new Array(width);
     let extra = null;
     let fi = 0;
     let lastQuoted = false;
-    let needRefresh = true;
-    let lineEnd = len;
+    let lineEnd = -1;
     let endKind = 0; // 0 = EOF, 1 = LF, 2 = CRLF, 3 = stray CR
 
     while (true) {
-      if (needRefresh) {
+      if (lineEnd < 0) {
         if (nextLF !== -1 && nextLF < pos) nextLF = text.indexOf('\n', pos);
         if (nextCR !== -1 && nextCR < pos) nextCR = text.indexOf('\r', pos);
         lineEnd = nextLF === -1 ? len : nextLF;
@@ -411,7 +376,6 @@ export function run(input) {
           lineEnd = nextCR;
           endKind = nextCR + 1 === nextLF ? 2 : 3;
         }
-        needRefresh = false;
       }
 
       let val;
@@ -421,15 +385,13 @@ export function run(input) {
         const ch0 = text.charCodeAt(pos);
         if (ch0 !== 34) {
           if (ch0 === 44) {
-            lastQuoted = false;
             val = '';
             pos += 1;
           } else {
-            let p = pos + 1;
-            while (p < lineEnd && text.charCodeAt(p) !== 44) p++;
-            if (p < lineEnd) {
-              val = text.slice(pos, p);
-              pos = p + 1;
+            if (nextComma !== -1 && nextComma < pos) nextComma = text.indexOf(',', pos + 1);
+            if (nextComma !== -1 && nextComma < lineEnd) {
+              val = text.slice(pos, nextComma);
+              pos = nextComma + 1;
             } else if (endKind !== 3) {
               val = text.slice(pos, lineEnd);
               pos = lineEnd + endKind;
@@ -437,68 +399,35 @@ export function run(input) {
               doneRow = true;
             } else {
               lastQuoted = false;
-              state.line = line;
-              val = readUnquotedSlow(text, len, pos, lineEnd, state, errors, recordLine, rows.length);
-              pos = state.pos;
-              line = state.line;
-              if (state.endedComma) needRefresh = true;
+              val = readUnquotedSlow(text, len, pos, lineEnd, line, errors, recordLine, rows.length);
+              pos = gPos;
+              line = gLine;
+              if (gEndedComma) lineEnd = -1;
               else doneRow = true;
             }
           }
         } else {
           lastQuoted = true;
           const pStart = pos + 1;
-          const firstQ = text.indexOf('"', pStart);
-          let q = firstQ;
-          let fastOk = false;
-
-          if (q !== -1 && q < lineEnd) {
-            if (q + 1 < len && text.charCodeAt(q + 1) === 34) {
-              let acc = text.slice(pStart, q + 1);
-              let seg = q + 2;
-              q = text.indexOf('"', seg);
-              while (q !== -1 && q < lineEnd && q + 1 < len && text.charCodeAt(q + 1) === 34) {
-                acc += text.slice(seg, q + 1);
-                seg = q + 2;
-                q = text.indexOf('"', seg);
-              }
-              if (q !== -1 && q < lineEnd) {
-                val = q === seg ? acc : acc + text.slice(seg, q);
-                fastOk = true;
-              }
-            } else {
-              val = q === pStart ? '' : text.slice(pStart, q);
-              fastOk = true;
-            }
-          }
-
-          if (fastOk) {
-            const after = q + 1;
-            if (after < lineEnd && text.charCodeAt(after) === 44) {
-              pos = after + 1;
-            } else if (after === lineEnd && endKind !== 3) {
-              pos = lineEnd + endKind;
-              if (endKind !== 0) line += 1;
-              doneRow = true;
-            } else {
-              state.line = line;
-              val = readQuoteJunk(text, len, after, val, state, errors, recordLine, rows.length);
-              pos = state.pos;
-              line = state.line;
-              if (state.endedComma) needRefresh = true;
-              else doneRow = true;
-            }
+          const q = text.indexOf('"', pStart);
+          const after = q + 1;
+          if (q !== -1 && q < lineEnd && after < lineEnd && text.charCodeAt(after) === 44) {
+            val = q === pStart ? '' : text.slice(pStart, q);
+            pos = after + 1;
+          } else if (q !== -1 && after === lineEnd && endKind !== 3) {
+            val = q === pStart ? '' : text.slice(pStart, q);
+            pos = lineEnd + endKind;
+            if (endKind !== 0) line += 1;
+            doneRow = true;
           } else {
-            state.line = line;
-            state.nextLF = nextLF;
-            state.nextCR = nextCR;
-            val = readQuotedSlow(text, len, pos, firstQ, state, errors, recordLine, rows.length);
-            pos = state.pos;
-            line = state.line;
-            nextLF = state.nextLF;
-            nextCR = state.nextCR;
-            if (state.endedComma) needRefresh = true;
-            else doneRow = true;
+            val = readQuotedComplex(text, len, pos, q, lineEnd, line, errors, recordLine, rows.length);
+            pos = gPos;
+            line = gLine;
+            if (gEndedComma) {
+              if (pos > lineEnd) lineEnd = -1;
+            } else {
+              doneRow = true;
+            }
           }
         }
       } else {
@@ -509,11 +438,10 @@ export function run(input) {
           if (endKind !== 0) line += 1;
           doneRow = true;
         } else {
-          state.line = line;
-          val = readUnquotedSlow(text, len, pos, lineEnd, state, errors, recordLine, rows.length);
-          pos = state.pos;
-          line = state.line;
-          if (state.endedComma) needRefresh = true;
+          val = readUnquotedSlow(text, len, pos, lineEnd, line, errors, recordLine, rows.length);
+          pos = gPos;
+          line = gLine;
+          if (gEndedComma) lineEnd = -1;
           else doneRow = true;
         }
       }
@@ -529,35 +457,63 @@ export function run(input) {
       if (doneRow) break;
     }
 
-    if (fi === width) {
-      if (fi === 1 && fields[0] === '' && !lastQuoted) continue;
-      rows.push(fields);
-    } else if (fi === 1 && fields[0] === '' && !lastQuoted) {
-      continue;
-    } else if (fi < width) {
-      errors.push({ code: 'short_row', line: recordLine, row: rows.length, fields: fi });
-      for (let i = fi; i < width; i++) fields[i] = '';
+    if (fi === width && (width > 1 || fields[0] !== '' || lastQuoted)) {
       rows.push(fields);
     } else {
-      errors.push({ code: 'long_row', line: recordLine, row: rows.length, extra });
-      rows.push(fields);
+      finishAbnormalRow(fields, fi, width, lastQuoted, extra, recordLine, rows, errors);
     }
+  }
+
+  gPos = pos;
+  gLine = line;
+  gNextLF = nextLF;
+  gNextCR = nextCR;
+  gNextComma = nextComma;
+}
+
+export function run(input) {
+  const text = String(input.text);
+  const header = input.header === true;
+  const len = text.length;
+  const errors = [];
+  const rows = [];
+
+  gPos = len > 0 && text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  gLine = 1;
+  gEndedComma = false;
+
+  const first = parseFirstRecord(text, len, errors, header);
+  if (first === null) {
+    return { columns: header ? [] : null, rows, errors };
+  }
+
+  const width = first.length;
+  const columns = header ? first : null;
+  if (!header) rows.push(first);
+
+  gNextLF = text.indexOf('\n', gPos);
+  gNextCR = text.indexOf('\r', gPos);
+  gNextComma = text.indexOf(',', gPos);
+
+  while (gPos < len) {
+    parseChunk(text, len, width, rows, errors, 512);
   }
 
   return { columns, rows, errors };
 }
 
-// Pre-seed V8 type feedback (OneByte & TwoByte) on tiny samples to eliminate mid-file Maglev deopts.
+// Pre-seed V8 type feedback (OneByte & TwoByte, LF/CRLF/no-CR/stray-CR/quoted/abnormal rows)
+// to prevent mid-file TurboFan eager deopts.
 {
-  const w1 = '\uFEFFa,b\r\n\r\n,1\r\n"","x""y""z"\r\n"ok"j,"m\r\n""n"j\r\n"p"j\r1\r\n\r\r\n1\r\n1,2,3,4\r\n4\r5,6\r7\r\n"u';
-  const w2 = 'café,b\n\n,1\n"","x""y"\n"ok"j,"m\rn\n""k"\n1,\n1\n1,2,3,4\n4\r5,6\r7\n"a\nb"';
-  const w3 = 'a,b\n1,2\n3,"4"';
-  const w4 = 'café,b\r\n"a\nb",1\r\n2,"3\r\n4"';
-  for (let i = 0; i < 2; i++) {
-    run({ text: w1, header: true });
-    run({ text: w2, header: false });
-    run({ text: w3, header: true });
-    run({ text: w4, header: false });
+  const wCRLF = '\uFEFFa,b\r\n\r\n,1\r\n"","x""y""z"\r\n"ok"j,"m\r\n""n"j\r\n"p"j\r1\r\n\r\r\n1\r\n1,2,3,4\r\n4\r5,6\r7\r\n\r,9\r\n"u';
+  const wLF = 'café,b\n\n,1\n"","x""y""z"\n"ok"j,"m\n\rn\n""k"j\n"q"\rj\n"z"\r,2\n1,\n1\n1,2,3,4\n4\r5,6\r7\n"a\nb"j,1\n"x""y';
+  const wNoCR = 'café,b\n1,2\n3,"4"\n"5"x,6\n"7"y\n"a\nb",c';
+  const w1 = 'a\n""\n\r\n\r\r\nb\n1,2,3\n';
+  for (let i = 0; i < 3; i++) {
+    run({ text: wCRLF, header: true });
+    run({ text: wLF, header: false });
+    run({ text: wNoCR, header: true });
+    run({ text: w1, header: false });
   }
   run({ text: '', header: true });
 }
