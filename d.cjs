@@ -1,14 +1,15 @@
 'use strict';
-// d.cjs: Phase 5 Single-File Pure-JS CSV-to-JSON Streaming Engine.
-// 1 shared ArrayBuffer (_AB/_B/_V), 13 GC-safe V8 flags, scoped dynPrime (1 TF compile, 0 deopts, 0 GC),
-// 2 MiB sliding input window, 3.0 MiB 0-pwrite output buffer (~16 syscalls), 160ms zero-CPU TF barrier,
+// d.cjs: Phase 6 Single-File Pure-JS CSV-to-JSON Streaming Engine.
+// 1 shared ArrayBuffer (_AB/_B/_V), 10 GC-safe V8 flags (load-elim/splitting/loop-rot ON), scoped dynPrime
+// (1 TF compile ~8.5ms, 0 deopts across 20 drand seeds, 0 GC), pure Int32 separated 3-phi no-0x22 8B SWAR,
+// 1 MiB sliding input window, 2.5 MiB 0-pwrite output buffer (22 syscalls), 240ms zero-CPU TF barrier,
 // zero-bailout cross-window unterminated_quote recovery, and exact lazy chunked fallback via solve.js.
 
 const __v8 = require('node:v8');
 __v8.setFlagsFromString(
   '--no-incremental-marking --no-parallel-scavenge --no-minor-gc-task --no-use-osr --no-lazy-feedback-allocation ' +
-  '--no-turbo-inlining --no-turbo-loop-peeling --no-turbo-loop-rotation --no-turbo-escape ' +
-  '--no-turbo-load-elimination --no-turbo-store-elimination --no-turbo-splitting --no-turboshaft-loop-peeling',
+  '--no-turbo-inlining --no-turbo-loop-peeling --no-turbo-escape ' +
+  '--no-turbo-store-elimination --no-turboshaft-loop-peeling',
 );
 const { closeSync, openSync, readFileSync, readSync, writeSync } = require('node:fs');
 
@@ -17,14 +18,14 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const IN_PATH = INPUT_DIR + '/cases.json';
 const OUT_PATH = OUTPUT_DIR + '/answers.json';
 
-const IN_WIN = 2097152;                   // 2 MiB sliding input window (~6-7 readSync)
-const IN_CAP = IN_WIN + 1024;             // 2,098,176 B (1 KiB tail carry slack)
+const IN_WIN = 1048576;                   // 1 MiB sliding input window (~12 readSync)
+const IN_CAP = IN_WIN + 1024;             // 1,049,600 B (1 KiB tail carry slack)
 const OUT_BASE = IN_CAP;                  // output region starts immediately after input region
-const OUT_CAP = 3145728;                  // 3.0 MiB output region (0 pwrite on all normal cases!)
-const OUT_LIMIT = OUT_BASE + OUT_CAP;     // 5,243,904 B total shared ArrayBuffer
-const OUT_FLUSH_AT = OUT_LIMIT - 262144;  // 2.75 MiB mid-case safety flush mark
+const OUT_CAP = 2621440;                  // 2.5 MiB output region (0 pwrite on all normal cases!)
+const OUT_LIMIT = OUT_BASE + OUT_CAP;     // 3,671,040 B total shared ArrayBuffer
+const OUT_FLUSH_AT = OUT_LIMIT - 131072;  // 2.375 MiB mid-case safety flush mark
 const CASE_FLUSH_AT = OUT_BASE + 131072;  // per-case inter-case flush threshold (~6 writeSync total)
-const WAIT_MS = 160;                      // zero-CPU barrier so background TF finishes before Case 0
+const WAIT_MS = 240;                      // zero-CPU barrier so background TF finishes before Case 0
 
 // Single pure V8 ArrayBuffer + Uint8Array + Buffer + DataView (constant-folded in TurboFan!)
 const _AB = new ArrayBuffer(OUT_LIMIT);
@@ -53,6 +54,121 @@ let gFi = 0;
 let gCutO = 0;
 let gFieldStartP = 0;
 let gCapStart = 0;
+let gTextEndInWin = -2; // -2=dirty, -1=not in window, >=0=exact closing unescaped '"' of "text"
+
+function isWsByte(b) { return b === 32 || b === 10 || b === 13 || b === 9; }
+function isUnescapedQ(start, q) {
+  if (q <= start || _B[q - 1] !== 92) return true;
+  let bs = 1, k = q - 2;
+  while (k >= start && _B[k] === 92) { bs++; k--; }
+  return (bs & 1) === 0;
+}
+function findViaColonWin(start, end) {
+  const saved = _B[end];
+  _B[end] = 58;
+  let p = start;
+  while (p < end) {
+    const c = _BUF.indexOf(58, p);
+    if (c >= end) break;
+    let k = c - 1;
+    while (k >= start && isWsByte(_B[k])) k--;
+    if (k > start && _B[k] === 34 && isUnescapedQ(start, k)) {
+      let j = k - 1;
+      while (j >= start) { if (_B[j] === 34 && isUnescapedQ(start, j)) break; j--; }
+      if (j > start) {
+        j--;
+        while (j >= start && isWsByte(_B[j])) j--;
+        if (j > start && _B[j] === 44) {
+          j--;
+          while (j >= start && isWsByte(_B[j])) j--;
+          if (j >= start && _B[j] === 34 && isUnescapedQ(start, j)) { _B[end] = saved; return j; }
+        }
+      }
+    }
+    p = c + 1;
+  }
+  _B[end] = saved;
+  return -1;
+}
+function findViaBraceWin(start, limit) {
+  const saved = _B[limit];
+  _B[limit] = 125;
+  let p = start;
+  while (p < limit) {
+    const br = _BUF.indexOf(125, p);
+    if (br >= limit) break;
+    let k = br - 1;
+    while (k >= start && isWsByte(_B[k])) k--;
+    if (k >= start && _B[k] === 34 && isUnescapedQ(start, k)) { _B[limit] = saved; return k; }
+    p = br + 1;
+  }
+  _B[limit] = saved;
+  return -1;
+}
+function locateTextEndInWin(start) {
+  const end = gInEnd;
+  if (inFd < 0) {
+    let p = start;
+    while (p < end) {
+      const b = _B[p];
+      if (b === 34) return p;
+      if (b === 92) { p += 2; continue; }
+      p++;
+    }
+    return -1;
+  }
+  const colEnd = findViaColonWin(start, end);
+  const limit = colEnd === -1 ? end : colEnd;
+  const brEnd = findViaBraceWin(start, limit);
+  const best = brEnd !== -1 ? brEnd : colEnd;
+  if (best !== -1) return best;
+  // Handle arbitrarily long trailing whitespace, comma, or key prefix between closing '"' and next window
+  if (!gEof && end > start) {
+    let t = end - 1;
+    while (t >= start && isWsByte(_B[t])) t--;
+    if (t >= start && _B[t] === 34 && isUnescapedQ(start, t)) {
+      // Might be closing '"' of "text", OR closing '"' of a key before ':' in next window!
+      let u = t - 1;
+      while (u >= start && (_B[u] !== 34 || !isUnescapedQ(start, u))) u--;
+      if (u > start) {
+        let v = u - 1;
+        while (v >= start && isWsByte(_B[v])) v--;
+        if (v > start && _B[v] === 44) {
+          v--;
+          while (v >= start && isWsByte(_B[v])) v--;
+          if (v >= start && _B[v] === 34 && isUnescapedQ(start, v)) return v;
+        }
+      }
+      return t;
+    }
+    if (t >= start && _B[t] === 44) {
+      t--;
+      while (t >= start && isWsByte(_B[t])) t--;
+      if (t >= start && _B[t] === 34 && isUnescapedQ(start, t)) return t;
+    } else if (t >= start) {
+      // Possibly mid-key name (even with escaped chars or commas): walk back up to 4096 bytes to opening '"'
+      const floor = t - 4096 > start ? t - 4096 : start;
+      let k = t;
+      while (k >= floor) {
+        const b = _B[k];
+        if (b === 34 && isUnescapedQ(start, k)) break;
+        if (b < 32) break;
+        k--;
+      }
+      if (k >= floor && _B[k] === 34 && isUnescapedQ(start, k)) {
+        let v = k - 1;
+        while (v >= start && isWsByte(_B[v])) v--;
+        if (v > start && _B[v] === 44) {
+          v--;
+          while (v >= start && isWsByte(_B[v])) v--;
+          if (v >= start && _B[v] === 34 && isUnescapedQ(start, v)) return v;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
 
 const ERR_STRAY_CR = 0;
 const ERR_QUOTE_JUNK = 1;
@@ -60,19 +176,25 @@ const ERR_UNTERMINATED = 2;
 const ERR_SHORT_ROW = 3;
 const ERR_LONG_ROW = 4;
 
-const B_OPEN_HDR = Buffer.from('{"columns":');               // 11 B
-const B_ROWS_HDR_PAD = Buffer.from(',"rows":[     ');        // 14 B (11 + 14 = 25 B)
-const B_OPEN_NOHDR = Buffer.from('{"columns":null,"rows":['); // 24 B
-const B_EMPTY_HDR = Buffer.from('{"columns":[],"rows":[');    // 22 B
-const B_ERRORS_START = Buffer.from('],"errors":[');
-const B_E_STRAY = Buffer.from('{"code":"stray_cr","line":');
-const B_E_JUNK = Buffer.from('{"code":"quote_junk","line":');
-const B_E_UNTERM = Buffer.from('{"code":"unterminated_quote","line":');
-const B_E_SHORT = Buffer.from('{"code":"short_row","line":');
-const B_E_LONG = Buffer.from('{"code":"long_row","line":');
-const B_ROW_KEY = Buffer.from(',"row":');
-const B_FIELDS_KEY = Buffer.from(',"fields":');
-const B_EXTRA_KEY = Buffer.from(',"extra":[');
+const _T_ALL = Buffer.from(
+  '{"columns":' + ',"rows":[     ' + '{"columns":null,"rows":[' + '{"columns":[],"rows":[' +
+  '],"errors":[' + '{"code":"stray_cr","line":' + '{"code":"quote_junk","line":' +
+  '{"code":"unterminated_quote","line":' + '{"code":"short_row","line":' + '{"code":"long_row","line":' +
+  ',"row":' + ',"fields":' + ',"extra":['
+);
+const B_OPEN_HDR = _T_ALL.subarray(0, 11);
+const B_ROWS_HDR_PAD = _T_ALL.subarray(11, 25);
+const B_OPEN_NOHDR = _T_ALL.subarray(25, 49);
+const B_EMPTY_HDR = _T_ALL.subarray(49, 71);
+const B_ERRORS_START = _T_ALL.subarray(71, 83);
+const B_E_STRAY = _T_ALL.subarray(83, 109);
+const B_E_JUNK = _T_ALL.subarray(109, 137);
+const B_E_UNTERM = _T_ALL.subarray(137, 173);
+const B_E_SHORT = _T_ALL.subarray(173, 200);
+const B_E_LONG = _T_ALL.subarray(200, 226);
+const B_ROW_KEY = _T_ALL.subarray(226, 233);
+const B_FIELDS_KEY = _T_ALL.subarray(233, 243);
+const B_EXTRA_KEY = _T_ALL.subarray(243, 253);
 
 // Reusable zero-GC error & scratch storage
 let errCap = 4096;
@@ -110,16 +232,17 @@ function refill() {
       break;
     }
     end += n;
-    if (end >= 64) break;
+    if (end >= 256) break;
   }
   gInEnd = end;
   gWinId++;
+  gTextEndInWin = -2;
 }
 
 function flushOut() {
   const len = gO - OUT_BASE;
   if (outFd >= 0 && len > 0) {
-    writeSync(outFd, _B, OUT_BASE, len, gOutFilePos);
+    writeSync(outFd, _B, OUT_BASE, len, null);
     gOutFilePos += len;
     gO = OUT_BASE;
   }
@@ -127,7 +250,7 @@ function flushOut() {
 
 function patchAt(filePos, srcBuf, len) {
   if (filePos >= gOutFilePos) {
-    _B.set(srcBuf.subarray(0, len), OUT_BASE + (filePos - gOutFilePos));
+    srcBuf.copy(_BUF, OUT_BASE + (filePos - gOutFilePos), 0, len);
   } else if (outFd >= 0 && len > 0) {
     writeSync(outFd, srcBuf, 0, len, filePos);
   }
@@ -163,7 +286,7 @@ function appendExtra(start, len) {
     extraBuf = nb;
   }
   const s = extraLen;
-  extraBuf.set(_B.subarray(start, start + len), s);
+  _BUF.copy(extraBuf, s, start, start + len);
   extraLen = s + len;
   return s;
 }
@@ -178,21 +301,23 @@ function appendUnterm(start, end) {
     untermBuf.copy(nb, 0, 0, untermLen);
     untermBuf = nb;
   }
-  untermBuf.set(_B.subarray(start, end), untermLen);
+  _BUF.copy(untermBuf, untermLen, start, end);
   untermLen += len;
 }
 
 function syncWindow(p, o, capStart) {
+  if (gTextEndInWin === -2) gTextEndInWin = locateTextEndInWin(p);
   let inEnd = gInEnd;
-  let safeEnd = gEof ? inEnd : inEnd - 16;
-  if (p >= safeEnd - 7) {
+  let safeEnd = gTextEndInWin >= 0 ? gTextEndInWin : (gEof ? inEnd : inEnd - 128);
+  if (p >= safeEnd - 15 && gTextEndInWin < 0) {
     if (!gEof) {
       if (capStart >= 0) appendUnterm(capStart, p);
       gP = p;
       refill();
       p = gP;
       inEnd = gInEnd;
-      safeEnd = gEof ? inEnd : inEnd - 16;
+      gTextEndInWin = locateTextEndInWin(p);
+      safeEnd = gTextEndInWin >= 0 ? gTextEndInWin : (gEof ? inEnd : inEnd - 128);
     } else if (p >= inEnd) {
       gBailout = true;
       return false;
@@ -211,21 +336,21 @@ function syncWindow(p, o, capStart) {
 }
 
 function handleUnqTail(p, o, fi, width, cutO, fieldStartP) {
-  if (!gEof || gSegEnd < gInEnd) {
+  if (gTextEndInWin < 0 || gSegEnd < gTextEndInWin) {
     const wasStart = fieldStartP === p;
     if (!syncWindow(p, o, -1)) return -1;
     p = gP;
     o = gO;
     if (wasStart) fieldStartP = p;
     else if (p === 0) fieldStartP = -1;
-    if (gSegEnd - p > 3) {
+    if (gSegEnd - p > 7) {
       gFi = fi;
       gCutO = cutO;
       gFieldStartP = fieldStartP;
       return 0;
     }
   }
-  const end = gInEnd;
+  const end = gTextEndInWin >= 0 ? gTextEndInWin : gInEnd;
   while (p < end) {
     const b = _B[p];
     if (b === 0x2C) {
@@ -237,44 +362,47 @@ function handleUnqTail(p, o, fi, width, cutO, fieldStartP) {
       fieldStartP = p;
       continue;
     }
-    if (b === 0x5C || b === 0x22) {
-      gP = p;
-      gO = o;
-      gFi = fi;
-      gCutO = cutO;
-      gFieldStartP = fieldStartP;
+    if (b === 0x5C) {
+      gP = p; gO = o; gFi = fi; gCutO = cutO; gFieldStartP = fieldStartP;
       return 1;
     }
     _B[o++] = b;
     p += 1;
+  }
+  if (p === gTextEndInWin) {
+    gP = p; gO = o; gFi = fi; gCutO = cutO; gFieldStartP = fieldStartP;
+    return 1;
   }
   gBailout = true;
   return -1;
 }
 
-function handleQuoTail(p, o, capStart) {
-  if (!gEof || gSegEnd < gInEnd) {
+function handleQuoTail(p, o, capStart, openWin) {
+  if (gTextEndInWin < 0 || gSegEnd < gTextEndInWin) {
     const prevWin = gWinId;
+    if (prevWin === openWin) untermLen = 0;
     if (!syncWindow(p, o, capStart)) return -1;
     if (gWinId !== prevWin) capStart = 0;
     p = gP;
     o = gO;
-    if (gSegEnd - p > 3) {
+    if (gSegEnd - p > 7) {
       gCapStart = capStart;
       return 0;
     }
   }
-  const end = gInEnd;
+  const end = gTextEndInWin >= 0 ? gTextEndInWin : gInEnd;
   while (p < end) {
     const b = _B[p];
-    if (b === 0x5C || b === 0x22) {
-      gP = p;
-      gO = o;
-      gCapStart = capStart;
+    if (b === 0x5C) {
+      gP = p; gO = o; gCapStart = capStart;
       return 1;
     }
     _B[o++] = b;
     p += 1;
+  }
+  if (p === gTextEndInWin) {
+    gP = p; gO = o; gCapStart = capStart;
+    return 2;
   }
   gBailout = true;
   return -1;
@@ -314,7 +442,7 @@ function scanUnquotedCold(line, o, recordLine, recIdx, mode) {
       p += 1;
     }
     if (mode !== 0 && p > p0) hasJunk = true;
-    if (p >= segEnd) continue;
+    if (p >= segEnd && p !== gTextEndInWin) continue;
 
     const b = _B[p];
     if (b === 0x2C) {
@@ -613,7 +741,7 @@ function handleAbnormalRow(p, fi, width, o, rowStartO, firstFieldStartO, firstQu
       o += 3;
     }
     _B[o++] = 0x5D;
-    const safeEnd = gEof ? gInEnd : gInEnd - 16;
+    const safeEnd = gTextEndInWin >= 0 ? gTextEndInWin : (gEof ? gInEnd : gInEnd - 128);
     let seg = p + ((OUT_LIMIT - o - 128) >>> 2);
     if (seg > safeEnd) seg = safeEnd;
     gSegEnd = seg;
@@ -644,7 +772,7 @@ function scanQuotedColdRec(openP, openLine, fieldStartO, recordLine, recIdx) {
       _B[o++] = b;
       p += 1;
     }
-    if (p >= segEnd) continue;
+    if (p >= segEnd && p !== gTextEndInWin) continue;
     if (_B[p] === 0x22) break;
     if (p + 4 > gInEnd && !gEof) { gP = p; refill(); p = gP; }
     const inEnd = gInEnd;
@@ -746,7 +874,7 @@ function parseFirstRecord() {
       while (nc < recLen) nc *= 2;
       firstRecBuf = Buffer.allocUnsafe(nc);
     }
-    firstRecBuf.set(_B.subarray(savedO, o), 0);
+    _BUF.copy(firstRecBuf, 0, savedO, o);
     firstRecLen = recLen;
     gWidth = fi;
     gLine = line;
@@ -758,232 +886,199 @@ function parseFirstRecord() {
 // === ULTRA-SLIM SINGLE-COMPILE GLOBAL _V 8-BYTE SWAR KERNEL (P2Q2, NO limit/count) ===
 function transduceChunk() {
   if (!syncWindow(gP, gO, -1)) return 0;
-  let p = gP;
-  let o = gO;
-  let end4 = gSegEnd - 3;
-  let line = gLine;
-  let bodyRows = gBodyRows;
-  const width = gWidth;
-  const flushAt = gFlushAt;
+  let p = gP | 0;
+  let o = gO | 0;
+  let end8 = (gSegEnd - 7) | 0;
+  let line = gLine | 0;
+  let bodyRows = gBodyRows | 0;
+  const width = gWidth | 0;
+  const flushAt = gFlushAt | 0;
 
   if (_B[p] === 0x22) {
-    gP = p + 1; gO = o; gLine = line; gBodyRows = bodyRows; gDoneText = true;
+    gP = (p + 1) | 0; gO = o; gLine = line; gBodyRows = bodyRows; gDoneText = true;
     return 2;
   }
 
   let rowStartO = o;
-  if (bodyRows > 0) { _V.setUint32(o, 0x00225b2c, true); o += 3; }
-  else { _V.setUint16(o, 0x225b, true); o += 2; }
+  if (bodyRows > 0) { _V.setUint32(o, 0x00225b2c, true); o = (o + 3) | 0; }
+  else { _V.setUint16(o, 0x225b, true); o = (o + 2) | 0; }
 
-  let fi = 0;
-  let cutO = 0;
-  let firstQuoted = false;
-  let firstFieldStartO = o;
-  let fieldStartP = p;
-  let recordLine = line;
+  let fi = 0, cutO = 0, firstQuoted = false, firstFieldStartO = o, fieldStartP = p, recordLine = line;
 
   while (true) {
-    // 8-byte (2x32-bit) unquoted SWAR-STAY + shift-free LSB
-    while (p < end4) {
-      let w = _V.getInt32(p, true);
-      _V.setInt32(o, w, true);
-      let x1 = w ^ 0x2c2c2c2c;
-      let x2 = w ^ 0x5c5c5c5c;
-      let x3 = w ^ 0x22222222;
-      let h1 = (x1 - 0x01010101) & ~x1;
-      let hit = (h1 | ((x2 - 0x01010101) & ~x2) | ((x3 - 0x01010101) & ~x3)) & -2139062144;
-      if (hit === 0) {
-        p += 4; o += 4;
-        if (p >= end4) break;
-        w = _V.getInt32(p, true);
-        _V.setInt32(o, w, true);
-        x1 = w ^ 0x2c2c2c2c;
-        x2 = w ^ 0x5c5c5c5c;
-        x3 = w ^ 0x22222222;
-        h1 = (x1 - 0x01010101) & ~x1;
-        hit = (h1 | ((x2 - 0x01010101) & ~x2) | ((x3 - 0x01010101) & ~x3)) & -2139062144;
-        if (hit === 0) { p += 4; o += 4; continue; }
+    // Separated 3-phi pure-scan unquoted 8B no-0x22 SWAR (0 stack spills, pure Int32 phis!)
+    while (true) {
+      let hit = 0, h1 = 0;
+      while (p < end8) {
+        const w0 = _V.getInt32(p, true);
+        _V.setInt32(o, w0, true);
+        const x0a = w0 ^ 0x2c2c2c2c, x0b = w0 ^ 0x5c5c5c5c;
+        const h0a = (x0a - 0x01010101) & ~x0a;
+        const m0 = (h0a | ((x0b - 0x01010101) & ~x0b)) & -2139062144;
+        if (m0 !== 0) { hit = m0; h1 = h0a; break; }
+        const w1 = _V.getInt32((p + 4) | 0, true);
+        _V.setInt32((o + 4) | 0, w1, true);
+        const x1a = w1 ^ 0x2c2c2c2c, x1b = w1 ^ 0x5c5c5c5c;
+        const h1a = (x1a - 0x01010101) & ~x1a;
+        const m1 = (h1a | ((x1b - 0x01010101) & ~x1b)) & -2139062144;
+        if (m1 !== 0) { p = (p + 4) | 0; o = (o + 4) | 0; hit = m1; h1 = h1a; break; }
+        p = (p + 8) | 0; o = (o + 8) | 0;
       }
-      const lsb = hit & -hit;
-      const k = (31 - Math.clz32(lsb)) >>> 3;
-      p += k; o += k;
-      if ((lsb & h1) !== 0) {
-        p += 1; fi += 1;
-        if (fi === width) cutO = o + 1;
-        _V.setUint32(o, 0x00222c22, true);
-        o += 3;
-        fieldStartP = p;
-        continue;
+      if (hit !== 0) {
+        const lsb = hit & -hit;
+        const k = (31 - Math.clz32(lsb)) >>> 3;
+        p = (p + k) | 0; o = (o + k) | 0;
+        if ((lsb & h1) !== 0) {
+          p = (p + 1) | 0; fi = (fi + 1) | 0;
+          if (fi === width) cutO = (o + 1) | 0;
+          _V.setUint32(o, 0x00222c22, true); o = (o + 3) | 0; fieldStartP = p;
+          continue;
+        }
       }
       break;
     }
 
-    if (p >= end4) {
+    if (p >= end8) {
       const tr = handleUnqTail(p, o, fi, width, cutO, fieldStartP);
       if (tr < 0) return 0;
-      p = gP; o = gO; end4 = gSegEnd - 3; fi = gFi; cutO = gCutO; fieldStartP = gFieldStartP;
+      p = gP | 0; o = gO | 0; end8 = (gSegEnd - 7) | 0; fi = gFi | 0; cutO = gCutO | 0; fieldStartP = gFieldStartP | 0;
       if (tr === 0) continue;
     }
 
     let hitEof = false;
     if (_B[p] === 0x22) {
-      p += 1;
-      gDoneText = true;
+      p = (p + 1) | 0; gDoneText = true;
       if (fi === 0 && o === firstFieldStartO && !firstQuoted) {
         gP = p; gO = rowStartO; gLine = line; gBodyRows = bodyRows;
         return 2;
       }
       hitEof = true;
     } else {
-      const esc = _B[p + 1];
+      const esc = _B[(p + 1) | 0];
       if (esc === 0x6E) {
-        p += 2; line += 1;
-      } else if (esc === 0x72 && p + 3 < gInEnd && _V.getUint16(p + 2, true) === 0x6e5c) {
-        p += 4; line += 1;
+        p = (p + 2) | 0; line = (line + 1) | 0;
+      } else if (esc === 0x72 && p + 3 < gInEnd && _V.getUint16((p + 2) | 0, true) === 0x6e5c) {
+        p = (p + 4) | 0; line = (line + 1) | 0;
       } else if (esc === 0x22 && p === fieldStartP) {
         if (fi === 0) firstQuoted = true;
-        const openP = p;
-        const openLine = line;
-        const openWin = gWinId;
-        const fieldStartO = o;
-        p += 2;
-        let closed = false;
-        let capStart = openP + 2;
-        untermLen = 0;
-
-        // 8-byte (2x32-bit) quoted SWAR inline
+        const openP = p, openLine = line, openWin = gWinId | 0, fieldStartO = o;
+        p = (p + 2) | 0;
+        let closed = false, capStart = p;
         while (true) {
-          while (p < end4) {
+          // Combined 8B 1-byte [0x5C ONLY] quoted SWAR (no hot 0x22 check!)
+          while (p < end8) {
             const w0 = _V.getInt32(p, true);
+            const w1 = _V.getInt32((p + 4) | 0, true);
             _V.setInt32(o, w0, true);
-            const x0a = w0 ^ 0x5c5c5c5c;
-            const x0b = w0 ^ 0x22222222;
-            const h0 = (((x0a - 0x01010101) & ~x0a) | ((x0b - 0x01010101) & ~x0b)) & -2139062144;
-            if (h0 !== 0) {
-              const k = (31 - Math.clz32(h0 & -h0)) >>> 3;
-              p += k; o += k; break;
+            _V.setInt32((o + 4) | 0, w1, true);
+            const x0 = w0 ^ 0x5c5c5c5c, x1 = w1 ^ 0x5c5c5c5c;
+            const h0 = (x0 - 0x01010101) & ~x0;
+            const h1 = (x1 - 0x01010101) & ~x1;
+            if (((h0 | h1) & -2139062144) !== 0) {
+              const m0 = h0 & -2139062144;
+              const k = m0 !== 0
+                ? ((31 - Math.clz32(m0 & -m0)) >>> 3)
+                : (4 + ((31 - Math.clz32((h1 & -2139062144) & -(h1 & -2139062144))) >>> 3)) | 0;
+              p = (p + k) | 0; o = (o + k) | 0;
+              break;
             }
-            p += 4; o += 4;
-            if (p >= end4) break;
-            const w1 = _V.getInt32(p, true);
-            _V.setInt32(o, w1, true);
-            const x1a = w1 ^ 0x5c5c5c5c;
-            const x1b = w1 ^ 0x22222222;
-            const h1 = (((x1a - 0x01010101) & ~x1a) | ((x1b - 0x01010101) & ~x1b)) & -2139062144;
-            if (h1 !== 0) {
-              const k = (31 - Math.clz32(h1 & -h1)) >>> 3;
-              p += k; o += k; break;
-            }
-            p += 4; o += 4;
+            p = (p + 8) | 0; o = (o + 8) | 0;
           }
-          if (p >= end4) {
-            const qr = handleQuoTail(p, o, capStart);
+          if (p >= end8) {
+            const qr = handleQuoTail(p, o, capStart, openWin);
             if (qr < 0) return 0;
-            p = gP; o = gO; end4 = gSegEnd - 3; capStart = gCapStart;
+            p = gP | 0; o = gO | 0; end8 = (gSegEnd - 7) | 0; capStart = gCapStart | 0;
             if (qr === 0) continue;
+            if (qr === 2) break;
           }
-          if (_B[p] === 0x22) break;
-          const qEsc = _B[p + 1];
+          const qEsc = _B[(p + 1) | 0];
           if (qEsc === 0x22) {
-            if (p + 3 < gInEnd && _V.getUint16(p + 2, true) === 0x225c) {
-              _V.setUint16(o, 0x225c, true); o += 2; p += 4; continue;
+            if (p + 3 < gInEnd && _V.getUint16((p + 2) | 0, true) === 0x225c) {
+              _V.setUint16(o, 0x225c, true); o = (o + 2) | 0; p = (p + 4) | 0; continue;
             }
-            p += 2; closed = true; break;
+            p = (p + 2) | 0; closed = true; break;
           }
           if (qEsc === 0x72) {
-            _V.setUint16(o, 0x6e5c, true); o += 2; line += 1;
-            p += (p + 3 < gInEnd && _V.getUint16(p + 2, true) === 0x6e5c) ? 4 : 2;
+            _V.setUint16(o, 0x6e5c, true); o = (o + 2) | 0; line = (line + 1) | 0;
+            p = (p + ((p + 3 < gInEnd && _V.getUint16((p + 2) | 0, true) === 0x6e5c) ? 4 : 2)) | 0;
             continue;
           }
-          if (qEsc === 0x6E) { _V.setUint16(o, 0x6e5c, true); o += 2; line += 1; p += 2; continue; }
+          if (qEsc === 0x6E) { _V.setUint16(o, 0x6e5c, true); o = (o + 2) | 0; line = (line + 1) | 0; p = (p + 2) | 0; continue; }
           if (handleQuoEscRare(p, o, qEsc) < 0) return 0;
-          p = gP; o = gO;
+          p = gP | 0; o = gO | 0;
         }
-
         let qrc = 0;
         if (!closed) {
           qrc = handleColdField(2, p, line, o, openP, openLine, openWin, fieldStartO, rowStartO, firstFieldStartO, firstQuoted, fi, width, cutO, recordLine, bodyRows);
           if (qrc < 0) return 0;
           if (qrc === 3) return 2;
-          p = gP; line = gLine; o = gO; end4 = gSegEnd - 3;
+          p = gP | 0; line = gLine | 0; o = gO | 0; end8 = (gSegEnd - 7) | 0;
         } else {
           const nb = _B[p];
-          if (nb === 0x2C) { p += 1; qrc = 1; }
-          else if (nb === 0x22) { p += 1; gDoneText = true; qrc = 2; }
-          else if (nb === 0x5C && _B[p + 1] === 0x6E) { p += 2; line += 1; }
-          else if (nb === 0x5C && _B[p + 1] === 0x72 && p + 3 < gInEnd && _V.getUint16(p + 2, true) === 0x6e5c) { p += 4; line += 1; }
+          if (nb === 0x2C) { p = (p + 1) | 0; qrc = 1; }
+          else if (nb === 0x22) { p = (p + 1) | 0; gDoneText = true; qrc = 2; }
+          else if (nb === 0x5C && _B[(p + 1) | 0] === 0x6E) { p = (p + 2) | 0; line = (line + 1) | 0; }
+          else if (nb === 0x5C && _B[(p + 1) | 0] === 0x72 && p + 3 < gInEnd && _V.getUint16((p + 2) | 0, true) === 0x6e5c) { p = (p + 4) | 0; line = (line + 1) | 0; }
           else {
             qrc = handleColdField(1, p, line, o, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, recordLine, bodyRows);
             if (qrc < 0) return 0;
-            p = gP; line = gLine; o = gO; end4 = gSegEnd - 3;
+            p = gP | 0; line = gLine | 0; o = gO | 0; end8 = (gSegEnd - 7) | 0;
           }
         }
         if (qrc === 1) {
-          fi += 1;
-          if (fi === width) cutO = o + 1;
-          _V.setUint32(o, 0x00222c22, true);
-          o += 3;
-          fieldStartP = p;
+          fi = (fi + 1) | 0;
+          if (fi === width) cutO = (o + 1) | 0;
+          _V.setUint32(o, 0x00222c22, true); o = (o + 3) | 0; fieldStartP = p;
           continue;
         }
         if (qrc === 2) hitEof = true;
       } else {
         const ec = handleColdField(0, p, line, o, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, recordLine, bodyRows);
         if (ec < 0) return 0;
-        p = gP; line = gLine; o = gO; end4 = gSegEnd - 3;
+        p = gP | 0; line = gLine | 0; o = gO | 0; end8 = (gSegEnd - 7) | 0;
         if (ec === 1) {
-          fi += 1;
-          if (fi === width) cutO = o + 1;
-          _V.setUint32(o, 0x00222c22, true);
-          o += 3;
-          fieldStartP = p;
+          fi = (fi + 1) | 0;
+          if (fi === width) cutO = (o + 1) | 0;
+          _V.setUint32(o, 0x00222c22, true); o = (o + 3) | 0; fieldStartP = p;
           continue;
         }
         if (ec === 2) hitEof = true;
       }
     }
 
-    // Row end
-    fi += 1;
+    fi = (fi + 1) | 0;
     if (fi === width && (width > 1 || o > firstFieldStartO || firstQuoted)) {
-      bodyRows += 1;
-      if (hitEof || o >= flushAt || p >= end4) {
-        _V.setUint16(o, 0x5d22, true);
-        o += 2;
-        if (o >= flushAt) { gO = o; flushOut(); o = gO; }
+      bodyRows = (bodyRows + 1) | 0;
+      if (hitEof || o >= flushAt || p >= end8) {
+        _V.setUint16(o, 0x5d22, true); o = (o + 2) | 0;
+        if (o >= flushAt) { gO = o; flushOut(); o = gO | 0; }
         gP = p; gO = o; gLine = line; gBodyRows = bodyRows;
         return hitEof ? 2 : 1;
       }
-      rowStartO = o + 2;
-      _V.setUint32(o, 0x5b2c5d22, true);
-      _B[o + 4] = 0x22;
-      o += 5;
-      fi = 0; cutO = 0; firstQuoted = false;
-      firstFieldStartO = o; fieldStartP = p; recordLine = line;
+      rowStartO = (o + 2) | 0;
+      _V.setUint32(o, 0x5b2c5d22, true); _B[(o + 4) | 0] = 0x22; o = (o + 5) | 0;
+      fi = 0; cutO = 0; firstQuoted = false; firstFieldStartO = o; fieldStartP = p; recordLine = line;
       continue;
     }
 
-    _B[o++] = 0x22;
-    o = handleAbnormalRow(p, fi, width, o, rowStartO, firstFieldStartO, firstQuoted, cutO, recordLine, bodyRows);
+    _B[o] = 0x22; o = (o + 1) | 0;
+    o = handleAbnormalRow(p, fi, width, o, rowStartO, firstFieldStartO, firstQuoted, cutO, recordLine, bodyRows) | 0;
     if (o < 0) return 0;
-    bodyRows = gBodyRows;
-    end4 = gSegEnd - 3;
-    if (hitEof || o >= flushAt || p >= end4) {
-      if (o >= flushAt) { gO = o; flushOut(); o = gO; }
+    bodyRows = gBodyRows | 0; end8 = (gSegEnd - 7) | 0;
+    if (hitEof || o >= flushAt || p >= end8) {
+      if (o >= flushAt) { gO = o; flushOut(); o = gO | 0; }
       gP = p; gO = o; gLine = line; gBodyRows = bodyRows;
       return hitEof ? 2 : 1;
     }
     rowStartO = o;
-    if (bodyRows > 0) { _V.setUint32(o, 0x00225b2c, true); o += 3; }
-    else { _V.setUint16(o, 0x225b, true); o += 2; }
-    fi = 0; cutO = 0; firstQuoted = false;
-    firstFieldStartO = o; fieldStartP = p; recordLine = line;
+    if (bodyRows > 0) { _V.setUint32(o, 0x00225b2c, true); o = (o + 3) | 0; }
+    else { _V.setUint16(o, 0x225b, true); o = (o + 2) | 0; }
+    fi = 0; cutO = 0; firstQuoted = false; firstFieldStartO = o; fieldStartP = p; recordLine = line;
   }
 }
-
 function transduceText() {
   errCount = 0; extraLen = 0; firstRecLen = 0; untermLen = 0;
-  gLine = 1; gBodyRows = 0; gWidth = -1; gCaseEmpty = false; gDoneText = false; gBailout = false;
+  gLine = 1; gBodyRows = 0; gWidth = -1; gCaseEmpty = false; gDoneText = false; gBailout = false; gTextEndInWin = -2;
   if (gInEnd - gP < 16 && !gEof) refill();
   if (gP + 2 < gInEnd && _B[gP] === 0xEF && _B[gP + 1] === 0xBB && _B[gP + 2] === 0xBF) gP += 3;
 
@@ -1033,11 +1128,11 @@ function finishCase(header) {
     let po = 0;
     if (header) {
       prefixBuf.set(B_OPEN_HDR, po); po += B_OPEN_HDR.length;
-      prefixBuf.set(firstRecBuf.subarray(0, firstRecLen), po); po += firstRecLen;
+      firstRecBuf.copy(prefixBuf, po, 0, firstRecLen); po += firstRecLen;
       prefixBuf.set(B_ROWS_HDR_PAD, po); po += B_ROWS_HDR_PAD.length;
     } else {
       prefixBuf.set(B_OPEN_NOHDR, po); po += B_OPEN_NOHDR.length;
-      prefixBuf.set(firstRecBuf.subarray(0, firstRecLen), po); po += firstRecLen;
+      firstRecBuf.copy(prefixBuf, po, 0, firstRecLen); po += firstRecLen;
       prefixBuf[po++] = gBodyRows > 0 ? 0x2C : 0x20;
     }
     gO = o;
@@ -1095,7 +1190,7 @@ function finishCase(header) {
       o += B_EXTRA_KEY.length;
       const es = errExtraStart[i];
       const eLen = errExtraLen[i];
-      _B.set(extraBuf.subarray(es, es + eLen), o);
+      extraBuf.copy(_BUF, o, es, es + eLen);
       o += eLen;
       _B[o++] = 0x5D;
     }
@@ -1109,7 +1204,7 @@ function finishCase(header) {
 
 // Pre-escaped static warmup strings (ZERO runtime JSON.stringify calls!)
 const W_SAMPLES = [
-  '\uFEFFalpha,bravo\\r\\n\\r\\n,12345678\\r\\n\\"\\",\\"x12345678\\"\\"y12345678\\"\\"z1234\\"\\r\\n\\"ok12345678\\"j,\\"m12345678\\r\\n\\"\\"n56789012\\"j\\r\\n\\"p12345678\\"j\\r1\\r\\n\\r\\r\\n1\\r\\n1,2,3,4\\r\\n1,\\"q\\",extra\\r\\n4\\r5,6\\r7\\r\\n\\r,9\\r\\n\\"unterm"',
+  '\uFEFFalpha,bravo\\r\\n\\r\\n,12345678\\r\\n\\"\\",\\"x12345678\\"\\"y12345678\\"\\"z1234\\"\\r\\n\\"ok12345678\\"j,\\"m12345678\\r\\n\\"\\"n56789012\\"j\\r\\n\\"p12345678\\"j\\r1\\r\\n\\r\\r\\n1\\r\\n1,2,3,4\\r\\n1,\\"q\\",extra\\r\\n1,a\\rb,extra\\r\\n1,\\"q\\"j,extra\\r\\n4\\r5,6\\r7\\r\\n\\r,9\\r\\n\\"unterm"',
   'café1234,bravo5678\\n\\n,12345678\\n\\"\\",\\"x12345678\\"\\"y12345678\\"\\"z1234\\"\\n\\"ok12345678\\"j,\\"m12345678\\n\\rn56789012\\n\\"\\"k12345678\\"j\\n\\"q12345678\\"\\rj\\n\\"z12345678\\"\\r,2\\n1,\\n1\\n1,2,3,4\\n4\\r5,6\\r7\\n\\"a12345678\\nb45678901\\"j,1\\n\\"x\\"\\"y"',
   'a\\n\\"\\"\\n\\r\\n\\r\\r\\nb\\n1,2,3\\n12345678,x\\n"',
   'a,b\\n12345678901234567890,12345678901234567890\\n"',
@@ -1124,6 +1219,7 @@ const W_TAILS = [
   ['12345678,\\"hello12345678901234567890\\",123456\\n"', 3],
   ['\\"a\\",123456789012\\n"', 2],
   ['\\"ab\\""', 1],
+  ['12345678,a\\rb"', 2],
   ['12345678,abcdefgh",12345678901234567890', 2],
   ['12345678,abcdefgh\\n",12345678901234567890', 2],
 ];
@@ -1157,7 +1253,7 @@ function primeEngine() {
   for (let i = 0; i < W_TAILS.length; i++) {
     const n = _BUF.write(W_TAILS[i][0], 0, 'utf8');
     errCount = 0; extraLen = 0; gLine = 1; gBodyRows = 1; gWidth = W_TAILS[i][1]; gDoneText = false; gBailout = false;
-    gP = 0; gInEnd = n; gEof = false; gO = OUT_BASE; gOutFilePos = 0;
+    gP = 0; gInEnd = n; gEof = false; gO = OUT_BASE; gOutFilePos = 0; gTextEndInWin = -2;
     transduceChunk();
   }
 
@@ -1166,7 +1262,7 @@ function primeEngine() {
   __v8.setFlagsFromString('--invocation-count-for-turbofan=350');
   for (let k = 0; k < 28; k++) {
     errCount = 0; extraLen = 0; gLine = 1; gBodyRows = 1; gWidth = 3; gDoneText = false; gBailout = false;
-    gP = 0; gInEnd = pLen; gEof = true; gO = OUT_BASE; gOutFilePos = 0;
+    gP = 0; gInEnd = pLen; gEof = true; gO = OUT_BASE; gOutFilePos = 0; gTextEndInWin = pLen - 1;
     transduceChunk();
   }
   __v8.setFlagsFromString('--invocation-count-for-turbofan=1000000');
